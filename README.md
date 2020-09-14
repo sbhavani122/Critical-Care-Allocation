@@ -1,4 +1,4 @@
-# critical_care_allocation
+# Critical Care Allocation
 ## final_code.rmd
 
 The data file should be read in as covid_sample, and formatted with the following columns for each patient (each patient is a unique row): 
