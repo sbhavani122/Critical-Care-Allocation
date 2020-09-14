@@ -1,0 +1,395 @@
+---
+title: "Simulation of Critical Care Allocation Strategies During the COVID-19 Pandemic"
+output:
+  html_document:
+    toc: yes
+    toc_depth: '2'
+    df_print: paged
+  html_notebook:
+    toc: yes
+    toc_depth: 2
+    toc_float: yes
+  pdf_document:
+    toc: yes
+    toc_depth: '2'
+---
+
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = FALSE, warning = FALSE, message = FALSE)
+```
+
+```{r libraries, include=FALSE, cache=FALSE}
+library(tidyverse)
+library(furrr)
+library(pROC)
+library(grid)
+library(lubridate)
+library(flextable)
+future::plan(multiprocess)
+library(radiant)
+library(ggpubr)
+library(svglite)
+```
+
+#Transform data into usable format
+```{r}
+
+nmhc <- read_csv("/data/COVID/data801/SOFA_COVID/res_icu_data2.csv") 
+uc = read_csv("/data/COVID/data801/SOFA_COVID/uc_deidentified.csv") 
+
+#Combine de-identified vectors of age, race, comorbidity score, SOFA, outcome from both medical systems
+covid_sample = rbind(nmhc, uc)
+
+#Elixhauser score transform into comorbidity category (primary analysis of 75th and 90th percentile for major and severe)
+major = unname(quantile(covid_sample$wscore_ahrq, c(0.75), na.rm=TRUE))
+severe = unname(quantile(covid_sample$wscore_ahrq, c(0.90), na.rm=TRUE))
+
+covid_sample = covid_sample%>%
+  mutate(
+    chronic_disease_state = case_when(
+      wscore_ahrq < major|is.na(wscore_ahrq) ~ "none",
+      wscore_ahrq >= major & wscore_ahrq < severe ~ "major",
+      wscore_ahrq >= severe ~ "severe"
+    ),
+    chronic_disease_state = factor(chronic_disease_state, levels = c("none", "major", "severe")),
+    alive = 1-died)
+
+```
+
+
+#Set simulation parameters
+```{r}
+set.seed(121456)
+sample_size <- nrow(covid_sample)
+
+N_samples <- 10000
+sample_list <- vector(mode = "list", length = N_samples)
+
+for (n in seq(1:N_samples)) {
+  sample_list[[n]] <- sample_n(covid_sample, sample_size, replace = T)
+}
+
+degree_scarcity <- 0.5
+vents <- floor(sample_size*degree_scarcity)
+```
+
+
+#Helper functions
+```{r}
+lives_saved <- function(allocation){
+  allocation %>%
+    filter(get_vent == "critical care (survival)") %>%
+    nrow()
+}
+
+
+
+allocation_performance <- function(alloc_list){
+  lives <- map_int(alloc_list, lives_saved)
+  
+  return(tibble(lives_saved = lives))
+}
+```
+
+#Allocation systems
+
+## Sickest first
+"Sickest first" allocation represents the default in american medicine under non-triage conditions. The sickest patients are prioritized because the less severely ill patients can wait their turn.
+```{r}
+sickest_first <- function(sim_pop, num_vents = vents){
+  
+  allocate <- sim_pop %>%
+    arrange(-sofa_num) %>%
+    mutate(get_vent = factor(case_when(
+      row_number() <= num_vents & alive ==1 ~  "critical care (survival)",
+      row_number() <= num_vents ~ "critical care (death)",
+      TRUE ~ "comfort care only"), levels = c("critical care (death)",
+                                            "critical care (survival)",
+                                            "comfort care only"))
+    )
+  return(allocate)
+}
+
+
+
+sickest_list <- map(.x = sample_list, sickest_first)
+
+sickest_first <- allocation_performance(sickest_list)
+```
+
+
+## NY allocation
+The New York allocation scheme relies on a categorization of the SOFA score and a lottery within priority tiers. Chronic disease state is not incorporated
+```{r}
+ny_allocate <- function(sim_pop,  num_vents = vents){
+  
+  lottery <- runif(n = sim_pop %>% nrow())
+  
+  
+  allocate <- sim_pop %>%
+    cbind(lottery) %>%
+    mutate(triage_cat = case_when(
+      sofa_num < 8 ~ "Highest",
+      sofa_num < 12 ~ "Intermediate",
+      TRUE ~ "No critical care"
+    ), priority_score = case_when(
+      triage_cat == "Highest" ~ lottery,
+      triage_cat == "Intermediate" ~ 1 + lottery,
+      TRUE ~ 2 + lottery)
+    ) %>%
+    arrange(priority_score) %>%
+    mutate(get_vent = factor(case_when(
+      row_number() <= num_vents & alive ==1 ~  "critical care (survival)",
+      row_number() <= num_vents ~ "critical care (death)",
+      TRUE ~ "comfort care only"), levels = c("critical care (death)",
+                                            "critical care (survival)",
+                                            "comfort care only"))
+    )
+  
+  return(allocate)
+  
+  
+}
+
+
+ny_list <- map(sample_list, ny_allocate)
+
+new_york <- allocation_performance(ny_list)
+```
+
+## Maryland
+This framework uses a combination of SOFA tiers and points for severe chronic disease, with age as a tiebreaker.
+```{r}
+maryland_rank <- function(sim_pop, num_vents = vents){
+  lottery <- runif(n = sim_pop %>% nrow())
+  
+  allocate <- sim_pop %>%
+    cbind(lottery) %>%
+    mutate(score = case_when(sofa_num < 9 ~ 1,
+                             sofa_num < 12 ~ 2,
+                             sofa_num < 15 ~ 3,
+                             TRUE ~ 4) +
+             case_when(
+               chronic_disease_state == "severe" ~ 3,
+               TRUE ~ 0),
+           age_cat_2 = case_when(
+             age < 50 ~ 1,
+             age < 70 ~ 2,
+             age < 85 ~ 3,
+             TRUE ~ 4)
+    ) %>%
+    arrange(score, age_cat_2, lottery) %>%
+    mutate(get_vent = factor(case_when(
+      row_number() <= num_vents & alive ==1 ~  "critical care (survival)",
+      row_number() <= num_vents ~ "critical care (death)",
+      TRUE ~ "comfort care only"), levels = c("critical care (death)", "critical care (survival)", "comfort care only"))
+    )
+  
+  return(allocate)
+}
+
+maryland_list <- future_map(sample_list, maryland_rank)
+maryland <- allocation_performance(maryland_list)
+```
+
+
+## Pennsylvania
+This framework uses a combination of SOFA tiers and points for major and severe chronic disease, with age as a tiebreaker.
+```{r}
+penn_pitt_allocate <- function(sim_pop, num_vents = vents){
+  
+  lottery <- runif(n = sim_pop %>% nrow())
+  
+  allocate <- sim_pop %>%
+    cbind(lottery) %>%
+    mutate(score = case_when(sofa_num < 6 ~ 1,
+                             sofa_num < 9 ~ 2,
+                             sofa_num < 12 ~ 3,
+                             TRUE ~ 4) +
+             case_when(chronic_disease_state == "major" ~ 2,
+                       chronic_disease_state == "severe" ~ 4,
+                       TRUE ~ 0),
+           age_cat_2 = case_when(
+             age < 41 ~ 1,
+             age < 61 ~ 2,
+             age < 76 ~ 3,
+             TRUE ~ 4)
+    ) %>%
+    arrange(score, age_cat_2, lottery) %>%
+    mutate(get_vent = factor(case_when(
+      row_number() <= num_vents & alive ==1 ~  "critical care (survival)",
+      row_number() <= num_vents ~ "critical care (death)",
+      TRUE ~ "comfort care only"), levels = c("critical care (death)", "critical care (survival)", "comfort care only"))
+    )
+  
+  return(allocate)
+}
+
+penn_pitt_list <- map(sample_list, penn_pitt_allocate)
+
+penn_pitt <- allocation_performance(penn_pitt_list)
+```
+
+## Lottery allocation
+In lottery allocation, critical care are assigned randomly without regard to the patient's age or probability of survival
+```{r}
+lottery_allocate <- function(sim_pop, num_vents = vents){
+  
+  lottery <- runif(n = sim_pop %>% nrow())
+  
+  allocate <- sim_pop %>%
+    cbind(lottery) %>%
+    arrange(lottery) %>%
+    mutate(get_vent = factor(case_when(
+      row_number() <= num_vents & alive ==1 ~  "critical care (survival)",
+      row_number() <= num_vents ~ "critical care (death)",
+      TRUE ~ "comfort care only"), levels = c("critical care (death)",
+                                            "critical care (survival)",
+                                            "comfort care only"))
+    )
+  
+  return(allocate)
+}
+
+lottery_list <- map(sample_list, lottery_allocate)
+lottery <-allocation_performance(lottery_list)
+```
+
+## Youngest first
+In youngest first allocation, the patients with the lowest age are assigned critical cares first. The severity of illness of the patients are ignored.
+```{r}
+youngest_allocate <- function(sim_pop, num_vents = vents){
+  
+  allocate <- sim_pop %>%
+    arrange(age) %>%
+    mutate(get_vent = factor(case_when(
+      row_number() <= num_vents & alive ==1 ~  "critical care (survival)",
+      row_number() <= num_vents ~ "critical care (death)",
+      TRUE ~ "comfort care only"), levels = c("critical care (death)",
+                                            "critical care (survival)",
+                                            "comfort care only"))
+    )
+  
+  return(allocate)
+}
+
+youngest_list <- map(sample_list, youngest_allocate)
+youngest <- allocation_performance(youngest_list)
+```
+
+# Comparing allocation systems
+## Table 2 - Combined dataframe
+```{r, cache =FALSE}
+combined_df <- lottery %>%
+  mutate(system = "Lottery") %>%
+  rbind(sickest_first %>% mutate(system = "Sickest first")) %>%
+  rbind(youngest %>% mutate(system = "Youngest first")) %>%
+  rbind(new_york %>% mutate(system = "New York"))%>%
+  rbind(maryland %>% mutate(system = "Maryland")) %>%
+  rbind(penn_pitt %>% mutate(system = "Pennsylvania")) %>%
+  mutate(system = factor(system, levels = c("Sickest first",
+                                            "Lottery",
+                                            "Youngest first",
+                                            "New York",
+                                            "Maryland",
+                                            "Pennsylvania")))
+
+
+table2 = combined_df%>%
+  group_by(system)%>%
+  summarise(lives = mean(100*lives_saved/sample_size),
+            lives5 = quantile(100*lives_saved/sample_size, probs = 0.025) %>% as.numeric(),
+            lives95 = quantile(100*lives_saved/sample_size, probs = 0.975) %>% as.numeric())
+
+
+```
+
+## Figure 2 - Distribution of lives-saved by system
+```{r, echo=FALSE}
+lives_saved_plot <- combined_df %>%
+  ggplot(aes(x= system, fill = system, y =  100*lives_saved/sample_size)) + # color = system,
+  # geom_dotplot(binaxis = "y", stackdir='center', binwidth =  0.003) +
+  geom_violin(trim=F, adjust=5) +
+  geom_boxplot(width=0.1, outlier.shape = NA) +
+  # stat_summary(fun.data="mean_sdl", mult=1, geom="crossbar", width=1 ) +
+  theme_classic() +
+  theme(axis.text = element_text(angle = 45, hjust = 1)) +theme(legend.position = "none")+
+  labs(x = "", y = "Lives saved (%)")
+
+lives_saved_plot
+
+ggsave("lives_saved.svg", plot = lives_saved_plot)
+
+
+```
+
+
+## Lives Saved Analysis
+```{r, echo=FALSE}
+
+
+data_wide <- combined_df%>%
+  select(lives_saved, system)%>%
+  mutate(subject = rep(1:N_samples, times=6))
+
+data_wide = spread(data_wide, system, lives_saved)
+
+
+variance = c()
+lowcon = c()
+highcon = c()
+conf = c()
+systems = c("Sickest first", "Lottery", "Youngest first", "New York", "Maryland", "Pennsylvania")
+for (i in 1:6) {
+  lowcon[i]=mean(combined_df$lives_saved[which(combined_df$system==systems[i])]) - (1.96*sd(combined_df$lives_saved[which(combined_df$system==systems[i])]))
+  highcon[i]=mean(combined_df$lives_saved[which(combined_df$system==systems[i])]) + (1.96*sd(combined_df$lives_saved[which(combined_df$system==systems[i])]))
+  conf[i] = paste(round(lowcon[i]*100/sample_size, digits = 1), "-", round(highcon[i]*100/sample_size, digits=1), sep = "")
+}
+
+lives_saved=table2%>%
+  mutate(confidence_interval = conf)
+
+lives_saved = lives_saved%>%
+  mutate(credible_interval = paste(round(lives5, digits=1), "-", round(lives95, digits=1), sep = ""))
+
+
+ttest = function(system1, system2){
+  numerator = abs(mean((combined_df$lives_saved[which(combined_df$system==system1)])- (combined_df$lives_saved[which(combined_df$system==system2)])))
+  variance_1= sd(combined_df$lives_saved[which(combined_df$system==system1)])^2
+  variance_2 = sd(combined_df$lives_saved[which(combined_df$system==system2)])^2
+  covar = data_wide%>%
+    select(matches(system1)|matches(system2))%>%
+    mutate(mean1 = mean(.[[1]]))%>%
+    mutate(mean2 = mean(.[[2]]))%>%
+    mutate(diff = abs(.[[1]]-mean1)*abs(.[[2]]-mean2))%>%
+    summarise(sum = sum(diff))%>%
+    deframe()/N_samples
+  z = numerator/(variance_1 + variance_2 - 2*covar)^0.5
+  p.value = 2*pt(-abs(z), df=sample_size-1)
+  p.value = ifelse(p.value<0.001, "<0.001", paste("=", signif(p.value, digits=1), sep = ""))
+  
+  return(p.value)
+}
+
+lives_comparisons = as.data.frame(matrix(nrow=6, ncol=7))%>%
+  mutate(V1= systems)%>%
+  rename("Sickest first" = V2)%>%
+  rename("Lottery" = V3)%>%
+  rename("Youngest first" = V4)%>%
+  rename("New York" = V5)%>%
+  rename("Maryland" = V6)%>%
+  rename("Pennsylvania" = V7)
+
+
+for (i in 1:6) {
+  for (j in 1:6) {
+    lives_comparisons[i,j+1] = ttest(systems[i], systems[j])
+  }
+}
+
+
+write_csv(lives_comparisons, "lives_comparison.csv")
+
+
+```
