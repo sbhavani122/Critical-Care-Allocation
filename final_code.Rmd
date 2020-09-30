@@ -35,11 +35,8 @@ library(svglite)
 #Transform data into usable format
 ```{r}
 
-nmhc <- read_csv("/data/COVID/data801/SOFA_COVID/res_icu_data2.csv") 
-uc = read_csv("/data/COVID/data801/SOFA_COVID/uc_deidentified.csv") 
-
-#Combine de-identified vectors of age, race, comorbidity score, SOFA, outcome from both medical systems
-covid_sample = rbind(nmhc, uc)
+#Read in data with age, race, comorbidity score, SOFA score, and outcome 
+covid_sample =  read_csv("/data/COVID/data801/SOFA_COVID/deidentified.csv") 
 
 #Elixhauser score transform into comorbidity category (primary analysis of 75th and 90th percentile for major and severe)
 major = unname(quantile(covid_sample$wscore_ahrq, c(0.75), na.rm=TRUE))
